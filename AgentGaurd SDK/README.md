@@ -1,172 +1,715 @@
-# AgentGuard
+# AgentGuard SDK 🛡️
 
-**Stops your AI agents from colliding, looping forever, or blowing your budget.**
+> **Runtime guardrails for multi-agent AI systems.**
+>
+> Detect runaway agent loops, enforce workflow budgets, and prevent conflicting resource access before your agents turn a small execution problem into an expensive one.
 
-Open-source governance layer for multi-agent systems built with [CrewAI](https://github.com/crewAIInc/crewAI) and [LangGraph](https://github.com/langchain-ai/langgraph).
+[![PyPI](https://img.shields.io/pypi/v/agentguard-sdk)](https://pypi.org/project/agentguard-sdk/)
+[![Python](https://img.shields.io/pypi/pyversions/agentguard-sdk)](https://pypi.org/project/agentguard-sdk/)
+[![License](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
+
+> ⚠️ **V1 / Experimental**
+>
+> AgentGuard is currently in its first public build. It is intended for **testing, experimentation, and developer feedback**, not production-critical workloads.
 
 ---
 
-## The problem
+## What problem does AgentGuard solve?
 
-A team once ran a multi-agent research system that cost $127/week. Two agents got stuck in a clarification loop — Agent A asked Agent B a question, B's answer prompted another question back to A — and it ran, undetected, for 11 days. By the time anyone noticed, the bill had climbed to **$47,000**.
+Multi-agent AI systems introduce a failure mode that is easy to miss:
 
-This isn't a one-off. It's the predictable result of a gap that every multi-agent framework currently has: **agents can act, but nothing makes sure they don't collide with each other, and nothing stops a runaway pattern before it gets expensive.**
+**an agent can continue acting even when the overall workflow has gone wrong.**
 
-Specifically, frameworks like CrewAI and LangGraph give you:
-- Step/recursion limits **per agent** — but no visibility into a repeating pattern *between* two or more agents talking to each other
-- No concept of a shared lock — so two agents can read-modify-write the same resource at nearly the same moment, and one of their changes silently disappears
-- No hard, real-time spending ceiling enforced *before* the next call — only a bill to review after the fact
+Consider a simple multi-agent workflow:
 
-AgentGuard sits in the execution path — not on the sidelines watching — and can say **no** before any of this happens.
-
-## How this is different from LangSmith / tracing tools
-
-LangSmith (and similar tools) are a security camera: they record everything and show you the footage afterward. AgentGuard is a security guard: it stands at the door in real time and can block an action *before* it happens.
-
-They're complementary, not competing — use LangSmith to review and debug, use AgentGuard to prevent the expensive failures in the first place.
-
-## What it does
-
-- **Resource locking** — one agent holds a lock on a resource (a DB row, a file, an API), a second agent asking for the same one gets denied or queued, instead of silently overwriting the first.
-- **Budget enforcement** — hard token/cost ceilings per agent and per workflow, checked *before* every call, not discovered after.
-- **Loop detection** — watches the live event stream for repeating agent-to-agent message patterns and cuts them off automatically.
-- **Live observability** — a terminal dashboard (built with [Textual](https://github.com/Textualize/textual)) showing active agents, spend, and locks in real time. No separate app, no browser — it lives in your terminal.
-- **Audit trail** — every claim, release, budget check, and event is logged, so "why did my agent get blocked?" always has an answer.
-
-### Deep Dive: The Loop Detection Engine
-
-Solving infinite loops in multi-agent systems is incredibly difficult without destroying performance or memory. Here is how AgentGuard evolved to handle it:
-
-1. **The Hash Problem:** We can't compare 10,000-word text strings efficiently, so we generate a 32-character MD5 hash of each prompt. It is blazing fast, but it fails on *Semantic Loops* (when agents repeat the exact same meaning using slightly different words).
-2. **The Semantic Problem:** To catch Semantic Loops, we introduced Python's `SequenceMatcher` to mathematically score text similarity (e.g. `similarity > 0.85`). However, if we run this on *every* message, we burn CPU. If we store *every* raw text message forever to do this, our memory footprint blows up.
-3. **The Final Architecture (Sliding Window & Suspicion Triggers):**
-   - **Sliding Window:** We strictly cap the memory to the last 10 events. When event 11 comes in, event 1 is deleted. Memory stays perfectly flat forever.
-   - **Suspicion Trigger:** We *only* run the heavy Semantic Check if the graph routing looks suspicious. If we see agents ping-ponging (e.g., `Agent_A` -> `Agent_B` -> `Agent_A` -> `Agent_B` repeating across the sliding window), the Semantic Check wakes up. Otherwise, it stays asleep.
-   
-This guarantees zero API costs, zero external dependencies, and near-zero latency.
-
-### Deep Dive: LangGraph Auto-Instrumentation (Zero-Configuration)
-
-To ensure the developer doesn't have to write custom guardrail code, AgentGuard hooks into LangChain's native `BaseCallbackHandler`. We intercept 4 specific lifecycle events under the hood:
-
-1. **`on_chain_start` (Who is acting?)**
-   We extract the `langgraph_node` from the metadata. This allows AgentGuard to know exactly which agent (e.g., "Agent_A") is currently running.
-2. **`on_llm_start` (Loop & Budget Check)**
-   Fires before an API call is made. We check the `LocalMemory` budget ceiling to prevent overspending. We also hash the prompt, save it to the Sliding Window, and check for Suspicious Ping-Pong patterns to trigger the Semantic SequenceMatcher. If any rule is broken, we raise an `AgentGuardException` which instantly aborts the agent.
-3. **`on_llm_end` (The Cash Register)**
-   Fires after a successful LLM response. We extract the exact `token_usage` from the provider's metadata, calculate the cost, and update the AgentGuard budget tracker.
-4. **`on_tool_start` & `on_tool_end` (Database Locks)**
-   Fires when an agent uses a tool. We map the `run_id` to a Resource Lock. If another agent holds the lock for that tool/database row, we block the action. When `on_tool_end` fires, we release the lock for the next agent.
-
-### The AgentGuard Client (Configuration)
-
-The developer interacts entirely with the `AgentGuard` class. It acts as a facade, hiding the complexity of `LocalMemory` and the Callbacks. It is designed with robust default values (like PyTorch) so it works out-of-the-box, but remains fully customizable:
-
-```python
-from agentguard import AgentGuard
-
-guard = AgentGuard(
-    budget_ceiling=10.0,            # Default: $10.00. Stops execution if exceeded.
-    loop_threshold=15,              # Default: 15. The size of the Sliding Window to check for loops.
-    semantic_sensitivity=0.90,      # Default: 0.90. The SequenceMatcher ratio required to trigger a Semantic Loop alarm.
-    engine_url=None                 # Default: None (Uses fast Local Dictionary). Pass a Redis URL to switch to Production mode.
-)
-
-# Inject into LangGraph
-graph.invoke(input, config={"callbacks": [guard.langgraph_callback()]})
+```text
+Agent A
+   ↓
+Agent B
+   ↓
+Agent A
+   ↓
+Agent B
+   ↓
+Agent A
+   ↓
+   ...
 ```
 
-### Deep Dive: Automatic Workflow Isolation (The "Wristband")
+Each individual agent may be behaving correctly.
 
-A major problem with zero-configuration SDKs is **Data Bleed**. If a developer runs three different LangGraph workflows simultaneously, how does the SDK prevent their sliding windows and budgets from mixing together into one chaotic pool?
+The problem appears at the **workflow level**.
 
-1. **The Problem:** Forcing developers to manually generate and pass a unique `workflow_id` for every single execution is tedious and ruins the developer experience.
-2. **The Solution:** We utilize LangChain's hidden execution tree. When a graph is invoked, it generates a root UUID. Every agent inside that graph is permanently stamped with a `parent_run_id` pointing back to that root (like a digital wristband). 
-3. **The Result:** AgentGuard secretly reads this `parent_run_id` and uses it to automatically create perfectly isolated memory folders for every concurrent execution in real-time. No manual IDs required.
+Two agents can repeatedly communicate with each other, consume model calls, accumulate tokens, modify shared resources, and continue running without an obvious failure at the individual-agent level.
 
-*(Note: If the developer *wants* to track an overarching budget across multiple executions, they can still explicitly pass `guard.langgraph_callback(workflow_id="sales_team")`, which elegantly overrides the automatic isolation).*
+Traditional application safeguards such as per-agent recursion limits don't necessarily understand this **agent-to-agent interaction**.
 
-### The Lazy Code Vulnerability & The Node-Level Pivot
+This creates three important risks:
 
-During testing, we discovered a fatal flaw in relying on LangChain's internal LLM callbacks.
+* 🔁 **Runaway loops** — agents repeatedly trigger one another.
+* 💸 **Uncontrolled spending** — a workflow continues making LLM calls beyond its intended budget.
+* 🔒 **Resource conflicts** — multiple agents attempt to modify the same resource concurrently.
 
-1. **The Problem:** If a developer writes "lazy" code and forgets to explicitly pass `config=config` into their LLM invocation (e.g., `llm.invoke(state)` instead of `llm.invoke(state, config=config)`), LangChain drops the callback. AgentGuard goes completely blind and the agent can loop infinitely without triggering the safety nets.
-2. **The Solution:** We executed a major architectural pivot. We ripped the entire Loop Detection algorithm out of the LLM boundary (`on_llm_start`) and moved it directly into the Graph Node boundary (`on_chain_start`). 
-3. **The Result:** LangGraph guarantees that `on_chain_start` fires for every single Node automatically, carrying the exact state of the graph with it. AgentGuard now intercepts the state, extracts the last message, and runs the Sliding Window (Deque) and SequenceMatcher checks *before the node even executes*. The SDK is now 100% Zero-Configuration and completely immune to lazy developer code.
+AgentGuard was built to provide a runtime safety layer for these situations.
 
-### The "Swallowed Exception" Problem (The Emergency Brake)
+---
 
-During final verification, we encountered a hidden LangChain behavior. 
+# What is AgentGuard?
 
-1. **The Problem:** LangChain callbacks are designed to be non-obtrusive loggers. By default, if a callback throws an exception, LangChain catches it, prints a warning to the console, and *swallows* the error, allowing the main graph to continue executing infinitely. This completely neutralizes AgentGuard's ability to act as an emergency brake.
-2. **The Solution:** We explicitly configured our `AgentGuardCallback` with the hidden `self.raise_error = True` parameter. 
-3. **The Result:** LangChain is now forced to respect our `AgentGuardException`. The exact millisecond a loop is detected, AgentGuard pulls the emergency brake and physically crashes the graph execution, preventing run-away API costs.
+**AgentGuard is a lightweight governance SDK that sits inside your agent workflow and monitors execution as it happens.**
 
-## Status
+Instead of being primarily an observability system that tells you what happened after an execution, AgentGuard is designed to act as an **execution-time guardrail**.
 
-🚧 Actively being built in public. This is an early MVP focused on CrewAI + LangGraph support. Contributions, issues, and "this blocked something it shouldn't have" reports are especially welcome — false positives are the failure mode we most want to catch early.
+```text
+                    Your AI Application
+                           │
+                           ▼
+                  ┌─────────────────┐
+                  │   AgentGuard    │
+                  │                 │
+                  │  Loop Detection │
+                  │  Budget Guard   │
+                  │  Resource Lock  │
+                  └────────┬────────┘
+                           │
+                           ▼
+                    Agent Workflow
+                           │
+              ┌────────────┼────────────┐
+              ▼            ▼            ▼
+           Agent A      Agent B      Agent C
+```
 
-## Quickstart
+The goal is simple:
+
+> **Let your agents act freely — but give the workflow an emergency brake.**
+
+---
+
+# AgentGuard vs. Observability Platforms
+
+Tools such as LangSmith are extremely useful for **observability, tracing, debugging, evaluation, and understanding what happened inside an LLM application**.
+
+AgentGuard addresses a different layer.
+
+|                        | Observability           | AgentGuard                     |
+| ---------------------- | ----------------------- | ------------------------------ |
+| Primary goal           | Understand executions   | Guard executions               |
+| Main focus             | Traces, logs, debugging | Runtime safety                 |
+| Detects loops          | Can help identify them  | Designed to stop them          |
+| Budget visibility      | Monitoring / analysis   | Runtime budget enforcement     |
+| Resource locking       | ❌                       | ✅                              |
+| Execution intervention | Primarily observability | Designed as an execution guard |
+| Position               | Around the application  | Inside the execution path      |
+
+**AgentGuard is not intended to replace LangSmith.**
+
+They can be complementary:
+
+```text
+              AI Application
+                   │
+          ┌────────┴────────┐
+          │                 │
+          ▼                 ▼
+     AgentGuard          LangSmith
+     "Stop it"           "Understand it"
+          │                 │
+          └────────┬────────┘
+                   ▼
+              Agent Workflow
+```
+
+Use observability tooling when you want to understand and analyze your system.
+
+Use AgentGuard when you want **runtime guardrails around the system itself**.
+
+---
+
+# What AgentGuard currently provides
+
+## 🔁 1. Agent Loop Detection
+
+AgentGuard monitors the execution stream for suspicious agent-to-agent repetition.
+
+It doesn't rely exclusively on exact string matching.
+
+The V1 implementation combines:
+
+* A bounded sliding window
+* Agent-to-agent routing patterns
+* Fast message hashing
+* Semantic similarity checks using `SequenceMatcher`
+* Suspicion-triggered semantic analysis
+
+This allows AgentGuard to detect situations where agents are effectively repeating the same interaction even when the exact wording changes.
+
+### Why a sliding window?
+
+Keeping the entire execution history in memory would continuously increase memory usage.
+
+AgentGuard instead maintains a bounded window:
+
+```text
+Event 1
+Event 2
+Event 3
+...
+Event 15
+```
+
+When a new event arrives:
+
+```text
+Event 16
+```
+
+the oldest event leaves the window:
+
+```text
+Event 2
+Event 3
+...
+Event 16
+```
+
+This keeps the memory footprint bounded.
+
+### Why not run semantic similarity on every event?
+
+Semantic comparison is more expensive than simple structural checks.
+
+AgentGuard therefore uses a **suspicion trigger**.
+
+```text
+New event
+   │
+   ▼
+Is the routing pattern suspicious?
+   │
+   ├── No ──► Continue
+   │
+   └── Yes
+          │
+          ▼
+   Semantic similarity check
+          │
+          ├── Normal ──► Continue
+          │
+          └── Loop ──► Stop execution
+```
+
+The intention is to keep the expensive check away from normal execution paths.
+
+---
+
+# 💰 2. Budget Enforcement
+
+AgentGuard allows you to define a spending ceiling for a workflow.
+
+For example:
+
+```python
+guard = AgentGuard(
+    budget_ceiling=10.0
+)
+```
+
+The workflow can then be guarded against exceeding the configured budget.
+
+The important design principle is:
+
+> **A budget should be enforced during execution, not discovered only after the bill arrives.**
+
+AgentGuard is intended to provide a runtime boundary around the workflow's allowed spend.
+
+---
+
+# 🔒 3. Resource Locking
+
+Multi-agent systems can have multiple agents interacting with shared resources.
+
+For example:
+
+```text
+Agent A ─────┐
+             ├──► Database Row
+Agent B ─────┘
+```
+
+Without coordination, both agents may attempt to modify the same resource concurrently.
+
+AgentGuard's resource-locking layer is intended to prevent these conflicting operations.
+
+This capability is part of the project's broader goal:
+
+> **Govern what agents are allowed to do while they are executing.**
+
+---
+
+# How AgentGuard works
+
+AgentGuard was designed around a few problems discovered while building V1.
+
+## 1. Exact matching wasn't enough
+
+A simple hash can quickly identify identical messages:
+
+```text
+"Ask the database for customer 123"
+        ↓
+       hash
+```
+
+But semantic loops don't always repeat the exact same text:
+
+```text
+"Find information about customer 123"
+
+"Retrieve the customer 123 details"
+
+"Can you look up data for customer 123?"
+```
+
+These messages can represent essentially the same interaction.
+
+AgentGuard therefore introduced semantic similarity analysis on suspicious execution patterns.
+
+---
+
+## 2. Unlimited history creates a memory problem
+
+Keeping every event indefinitely would make the guard's memory usage grow with execution length.
+
+V1 solves this with a bounded `deque`-based sliding window.
+
+```text
+Bounded memory
+      ↓
+Recent execution context
+      ↓
+Suspicion detection
+      ↓
+Semantic verification
+```
+
+---
+
+## 3. Multiple workflows must not share state
+
+A zero-configuration SDK cannot ask developers to manually create a unique workflow ID every time they execute a graph.
+
+LangGraph already provides execution metadata that can be used to associate child executions with their parent workflow.
+
+AgentGuard uses this execution context to isolate workflow state.
+
+Conceptually:
+
+```text
+Workflow A
+   ├── Agent 1
+   ├── Agent 2
+   └── Agent 3
+
+Workflow B
+   ├── Agent 1
+   └── Agent 2
+```
+
+The state associated with Workflow A should not accidentally become part of Workflow B.
+
+AgentGuard therefore creates execution-level isolation automatically.
+
+Developers can also explicitly provide a workflow identifier when they want multiple executions to share a broader budget or tracking boundary.
+
+---
+
+## 4. LLM-level callbacks were not reliable enough
+
+During development, a major problem appeared:
+
+A developer could invoke an LLM without correctly propagating the callback configuration.
+
+That meant the guard could lose visibility into the execution.
+
+The architecture therefore moved the core loop-detection logic away from relying solely on the LLM boundary and toward the **graph/node execution boundary**.
+
+Conceptually:
+
+```text
+Before:
+
+Graph
+  ↓
+Node
+  ↓
+LLM
+  ↓
+Callback
+  ↓
+Guard
+
+
+V1 approach:
+
+Graph
+  ↓
+Node boundary
+  ↓
+AgentGuard
+  ↓
+Loop / budget checks
+  ↓
+Node execution
+```
+
+This makes the guard less dependent on developers manually passing callback configuration through every individual model invocation.
+
+---
+
+# 5. The "swallowed exception" problem
+
+Another important discovery during development was that callback exceptions can be handled differently from normal application exceptions.
+
+If a guard raises an exception but the framework treats callback failures as non-critical, the workflow may continue.
+
+That defeats the purpose of an emergency brake.
+
+AgentGuard therefore configures its callback behavior so that the guard's exception can propagate and stop the execution when a configured safety condition is triggered.
+
+Conceptually:
+
+```text
+Loop detected
+     │
+     ▼
+AgentGuardException
+     │
+     ▼
+Execution interrupted
+```
+
+The goal is not simply to **report** that a loop happened.
+
+The goal is to prevent the runaway execution from continuing.
+
+---
+
+# Installation
+
+AgentGuard is currently distributed through PyPI.
 
 ```bash
-# clone and bring up the engine (FastAPI + Postgres + Redis)
-git clone https://github.com/<your-username>/agentguard.git
-cd agentguard
-docker compose up
-
-# in your agent project
 pip install agentguard-sdk
 ```
 
-Protect an existing CrewAI crew in three lines:
+Then install the framework integration you intend to use.
 
-```python
-from agentguard import AgentGuard
-
-guard = AgentGuard(api_key="your-key", engine_url="http://localhost:8000")
-crew = Crew(agents=[...], tasks=[...], callbacks=guard.crewai_hooks())
-```
-
-Or a LangGraph graph:
-
-```python
-from agentguard import AgentGuard
-
-guard = AgentGuard(api_key="your-key", engine_url="http://localhost:8000")
-graph = builder.compile(middleware=[guard.langgraph_middleware()])
-```
-
-Watch it live:
+For the current LangGraph integration:
 
 ```bash
-agentguard dashboard
+pip install langgraph
 ```
 
-## Architecture
+If your application already uses LangChain/LangGraph, install the versions required by your application as usual.
 
+---
+
+# Quick Start — LangGraph
+
+A minimal integration looks like this:
+
+```python
+from AgentGaurd_SDK.client import AgentGuard
+from langgraph.graph import StateGraph
+
+# 1. Create the guard
+guard = AgentGuard(
+    budget_ceiling=10.0,
+    loop_threshold=15,
+    semantic_sensitivity=0.90,
+)
+
+# 2. Build your LangGraph normally
+builder = StateGraph(AgentState)
+
+# Add your nodes and edges...
+# builder.add_node(...)
+# builder.add_edge(...)
+
+graph = builder.compile()
+
+# 3. Attach AgentGuard to the graph execution
+result = graph.invoke(
+    {"messages": [HumanMessage(content="Hello!")]},
+    config={
+        "callbacks": [
+            guard.langgraph_callback()
+        ]
+    },
+)
 ```
-CrewAI / LangGraph agent
-        │
-        ▼
-  AgentGuard SDK (hooks/middleware)
-        │
-        ▼
-  AgentGuard engine (FastAPI)
-    ├── Redis   → live locks, budget counters, heartbeats
-    └── Postgres → durable registry, audit log, history
-        │
-        ▼
-  Terminal dashboard (Textual)
+
+That's the basic integration model:
+
+```text
+Create Guard
+     ↓
+Build Graph
+     ↓
+Compile Graph
+     ↓
+Attach Guard callback
+     ↓
+Invoke Graph
 ```
 
-## Tech stack
+---
 
-Python end to end: FastAPI, SQLModel, PostgreSQL, Redis, Textual. See [`agentguard-planning.md`](./agentguard-planning.md) for the full schema and API design.
+# Configuration
 
-## Contributing
+The V1 guard can be configured with parameters such as:
 
-Issues and PRs welcome. If AgentGuard blocks something it shouldn't have, that's the most valuable bug report you can file — please include your framework, version, and what you expected to happen.
+```python
+guard = AgentGuard(
+    budget_ceiling=10.0,
+    loop_threshold=15,
+    semantic_sensitivity=0.90,
+)
+```
 
-## License
+### `budget_ceiling`
 
-Apache 2.0
+Maximum configured spending boundary for the guarded workflow.
+
+```python
+budget_ceiling=10.0
+```
+
+### `loop_threshold`
+
+Controls the number of events considered within the loop-detection window.
+
+```python
+loop_threshold=15
+```
+
+### `semantic_sensitivity`
+
+Controls how similar messages must be before they are treated as a potential semantic repetition.
+
+```python
+semantic_sensitivity=0.90
+```
+
+Higher values generally require closer similarity.
+
+---
+
+# Explicit Workflow IDs
+
+AgentGuard can automatically isolate executions based on the workflow execution context.
+
+If you want to explicitly group executions under a common workflow identifier, you can provide one:
+
+```python
+guard.langgraph_callback(
+    workflow_id="sales_team"
+)
+```
+
+This can be useful when you want a broader budget or tracking boundary across multiple executions.
+
+---
+
+# Current Framework Support
+
+### V1
+
+| Framework | Status                                |
+| --------- | ------------------------------------- |
+| LangGraph | ✅ Available                           |
+| LangChain | 🟡 Used through LangGraph integration |
+| CrewAI    | 🚧 Planned                            |
+
+AgentGuard is currently being developed toward a framework-agnostic architecture, but **V1 should be considered primarily a LangGraph-focused implementation**.
+
+---
+
+# Current Architecture
+
+At a high level:
+
+```text
+                   LangGraph
+                       │
+                       ▼
+              ┌─────────────────┐
+              │   AgentGuard    │
+              ├─────────────────┤
+              │                 │
+              │ Workflow        │
+              │ Isolation       │
+              │                 │
+              │ Loop Detection  │
+              │                 │
+              │ Budget Guard    │
+              │                 │
+              │ Resource Locks  │
+              │                 │
+              └────────┬────────┘
+                       │
+                       ▼
+                Graph Execution
+```
+
+The V1 implementation primarily uses local in-process state.
+
+This is intentional for the current development stage.
+
+---
+
+# V1 Status & Limitations
+
+AgentGuard is **not production-ready yet**.
+
+This release is a public V1 intended to answer questions such as:
+
+* Does the guard detect real-world multi-agent loops reliably?
+* Are the detection thresholds useful?
+* How much overhead does the guard introduce?
+* Are the budget boundaries accurate enough?
+* Does the resource-locking model work for practical workflows?
+* What failure modes have not yet been covered?
+* What framework abstractions are needed for broader support?
+
+The project is being developed publicly so developers can test it, break it, report edge cases, and help shape future versions.
+
+### Known V1 direction
+
+The current implementation is:
+
+* Local / in-process
+* LangGraph-focused
+* Experimental
+* Not yet designed for distributed production workloads
+* Subject to API and architecture changes
+
+**If you test AgentGuard, feedback is highly valuable.**
+
+Open an issue with:
+
+1. Your framework/version
+2. Agent topology
+3. Expected behavior
+4. Actual behavior
+5. Relevant logs or minimal reproduction
+
+---
+
+# Roadmap
+
+AgentGuard is being developed in four planned phases.
+
+### Phase 1 — Foundation
+
+* [x] Local execution memory
+* [x] Sliding-window loop detection
+* [x] Semantic similarity checks
+* [x] LangGraph integration
+* [x] Node-level execution guardrails
+* [x] Workflow isolation
+
+**Current phase**
+
+### Phase 2 — Framework Expansion
+
+* [ ] Native CrewAI integration
+* [ ] Additional agent framework integrations
+* [ ] Common framework abstraction layer
+
+### Phase 3 — Developer Dashboard
+
+* [ ] Terminal/TUI monitoring
+* [ ] Real-time execution windows
+* [ ] Budget visualization
+* [ ] Loop visualization
+* [ ] Guard events and diagnostics
+
+### Phase 4 — Distributed Runtime
+
+* [ ] Redis-backed state
+* [ ] PostgreSQL-backed state
+* [ ] Distributed resource locks
+* [ ] Production-scale workflow coordination
+
+---
+
+# Why build this?
+
+Agentic systems are moving from single model calls toward workflows where multiple autonomous components can reason, call tools, communicate, and modify shared state.
+
+That creates a different class of engineering problems.
+
+The question is no longer only:
+
+> **"Did my model give a good answer?"**
+
+It also becomes:
+
+> **"What happens when my agents behave incorrectly together?"**
+
+AgentGuard is an attempt to build the missing runtime safety layer around that problem.
+
+---
+
+# Contributing
+
+AgentGuard is open source and currently maintained by:
+
+**Rugved Milind Borgaonkar**
+
+The project is intentionally being developed in public.
+
+If you find a bug, discover an edge case, have an idea for a guardrail, or want to experiment with the architecture:
+
+1. Open an issue.
+2. Describe the problem clearly.
+3. Include a minimal reproduction where possible.
+4. Explain what behavior you expected.
+5. For larger changes, open a pull request with context.
+
+As the project grows, formal contribution guidelines will be added separately.
+
+---
+
+# License
+
+AgentGuard SDK is released under the **MIT License**.
+
+Copyright © 2026 **Rugved Milind Borgaonkar**
+
+See [`LICENSE`](LICENSE) for the complete license text.
+
+---
+
+# Author
+
+**Rugved Milind Borgaonkar**
+
+Built as an open-source experiment into runtime governance and safety for multi-agent AI systems.
+
+If you are building multi-agent systems with LangGraph and test AgentGuard, feedback on what breaks, what is missing, and what should be redesigned is especially welcome.
+
+---
+
+## Project Status
+
+```text
+AgentGuard SDK
+Version: 0.1.0
+Status: Experimental / V1
+Primary integration: LangGraph
+License: MIT
+Maintainer: Rugved Milind Borgaonkar
+```
