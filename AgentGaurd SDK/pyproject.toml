@@ -1,7 +1,38 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
 [project]
 name = "agentgaurd-sdk"
 version = "0.1.0"
-description = "Add your description here"
+description = "Zero-configuration auto-instrumentation and guardrails for multi-agent LLM frameworks."
 readme = "README.md"
 requires-python = ">=3.13"
-dependencies = []
+license = { text = "MIT" }
+authors = [
+  { name = "Rugved Milind Borgaonkar" }
+]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Intended Audience :: Developers",
+]
+dependencies = [
+    "langgraph>=1.2.10",
+]
+
+[project.optional-dependencies]
+dev = [
+    "langgraph",
+    "langchain-core"
+]
+
+[project.urls]
+Homepage = "https://github.com/RugvedBorgaonkar2003/Agent_Guard-SDK"
+Repository = "https://github.com/RugvedBorgaonkar2003/Agent_Guard-SDK"
+Author = "https://github.com/RugvedBorgaonkar2003"
+
+[tool.hatch.build.targets.wheel]
+packages = ["AgentGaurd_SDK"]
+
